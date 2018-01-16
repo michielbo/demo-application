@@ -4,34 +4,13 @@ import logging
 from datetime import datetime
 import json
 from tornado import gen, ioloop
-from tornado.ioloop import PeriodicCallback
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.escape import json_decode
 import dateutil.parser
-import sys
 import argparse
-import string
 import toml
 
-"""
-API:
 
-/ui
-/ping
-/status
-{ 
-     id: { site:"", tier:"", name:"" }
-     connections: [
-       { direction: "in|out",
-         target: "",
-         live: true|false
-         last_seen:
-         message:  
-        }
-     ],
-/dot
-/png
-"""
 LOGGER = logging.getLogger(__name__)
 
 # time before a host is considered dead
@@ -59,6 +38,9 @@ class Connection(object):
     def is_in(self):
         return self.direction == DIRECTION_IN
 
+    def is_alive(self):
+        return self.live and (datetime.now() - self.last_seen).total_seconds() < TIMEOUT_SECONDS 
+
     def seen(self, remote_id="", message=""):
         self.last_seen = datetime.now()
         self.live = True
@@ -75,7 +57,7 @@ class Connection(object):
         return {
             "direction": self.direction,
             "target": self.target,
-            "live": self.live,
+            "live": self.is_alive(),
             "last_seen": self.last_seen,
             "message": self.message,
             "id": self.remote_id
@@ -98,7 +80,6 @@ class TopoNode(object):
 
     def update(self, toids, last_seen):
         # update if newer and live
-
         if last_seen >= self.last_seen:
             if (datetime.now() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
                 LOGGER.debug("updating topo node %s for new %s", self.fromid, toids)
@@ -191,7 +172,7 @@ class APP(object):
     def build_self_topo(self):
         id = "%s|%s|%s" % (self.site, self.tier, self.name)
         node = self._get_toponode(id)
-        to = [x.short_remote_id() for x in self.connections.values() if not x.is_in() and x.live]
+        to = [x.short_remote_id() for x in self.connections.values() if not x.is_in() and x.is_alive()]
         node.update(to, datetime.now())
 
     def update_topology_safe(self, topo):
@@ -239,9 +220,6 @@ class APP(object):
 
         while True:
             start = ioloop.time()
-
-            for connection in [c for c in self.connections.values() if c.is_in() and c.live and c.age() > TIMEOUT_SECONDS]:
-                connection.dead()
 
             for toponode in [k for k, c in self._topology.items() if c.age() > TOPOLOGY_TIMEOUT_SECONDS]:
                 del self._topology[toponode]
