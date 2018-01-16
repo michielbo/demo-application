@@ -343,13 +343,30 @@ class PngHandler(AppHandler):
     @gen.coroutine
     def get(self):
         self.set_header("Content-Type", "image/png")
+        self.set_header("Cache-Control:", "no-store")
         dot = self.app.topology_dot()
-        proc = tornado.process.Subprocess(["dot", "-Tpng"], stdin=tornado.process.Subprocess.STREAM, stdout=tornado.process.Subprocess.STREAM)
+        proc = tornado.process.Subprocess(["dot", "-Tpng"], stdin=tornado.process.Subprocess.STREAM,
+                                          stdout=tornado.process.Subprocess.STREAM)
         yield proc.stdin.write(dot.encode())
         proc.stdin.close()
         ret = yield proc.wait_for_exit()
         png = yield proc.stdout.read_until_close()
         self.write(png)
+
+
+class IndexHandler(tornado.web.RequestHandler):
+
+    @gen.coroutine
+    def get(self):
+        self.set_header("Content-Type", "text/html")
+        self.write("""<html> <head> 
+<script type="text/JavaScript">
+function TimedRefresh( t ) {
+    setTimeout("location.reload(true);", t);
+}
+</script>
+</head> <body onload="JavaScript:TimedRefresh(5000);"> <img src="png"/> </body> </html>
+""")
 
 
 def make_app(site, tier, name, connect_to, port=8888):
@@ -361,7 +378,10 @@ def make_app(site, tier, name, connect_to, port=8888):
         (r"/status", StatusHandler, {"app": app}),
         (r"/topo", TopoHandler, {"app": app}),
         (r"/dot", DotHandler, {"app": app}),
-        (r"/png", PngHandler, {"app": app})
+        (r"/png", PngHandler, {"app": app}),
+        (r"/", IndexHandler),
+        (r"/index.html", IndexHandler)
+
     ])
 
     app.listen(port)
