@@ -1,0 +1,5 @@
+site="S1"
+tier="T1"
+name="Node2"
+port=8887
+connect_to=["http://127.0.0.1:8888","http://127.0.0.1:8887","http://127.0.0.1:8886"]

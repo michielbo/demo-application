@@ -10,5 +10,5 @@ setup(name='App',
       author_email='wouter.deborger@inmanta.com',
       package_dir={"": "src"},
       packages=find_packages("src"),
-      install_requires=["tornado"]
+      install_requires=["tornado", "toml", "python-dateutil"]
       )

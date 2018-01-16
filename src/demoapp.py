@@ -7,6 +7,11 @@ from tornado import gen, ioloop
 from tornado.ioloop import PeriodicCallback
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.escape import json_decode
+import dateutil.parser
+import sys
+import argparse
+import string
+import toml
 
 """
 API:
@@ -86,16 +91,29 @@ class TopoNode(object):
     def __init__(self, fromid):
         self.fromid = fromid
         self.last_seen = datetime.now()
+        self.toids = []
 
-    def update(self, toids):
-        self.toids = toids
-        self.last_seen = datetime.now()
+    def is_alive(self):
+        return (datetime.now() - self.last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS
+
+    def update(self, toids, last_seen):
+        # update if newer and live
+
+        if last_seen >= self.last_seen:
+            if (datetime.now() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
+                LOGGER.debug("updating topo node %s for new %s", self.fromid, toids)
+                self.toids = toids
+                self.last_seen = last_seen
+            else:
+                LOGGER.debug("Not updating node %s for new %s due to stale data", self.fromid, toids)
+        else:
+            LOGGER.debug("Not updating node %s for new %s due to not newer %s", self.fromid, toids, last_seen)
 
     def age(self):
         return (datetime.now() - self.last_seen).total_seconds()
 
-    def to_pair(self):
-        return (self.fromid, self.target)
+    def to_dict(self):
+        return {"from": self.fromid, "target": self.toids, "timestamp": self.last_seen.isoformat()}
 
 
 def custom_json_encoder(o):
@@ -168,13 +186,13 @@ class APP(object):
         return connection
 
     def topology(self):
-        return {tn.fromid: tn.toids for tn in self._topology.values()}
+        return [tn.to_dict() for tn in self._topology.values() if tn.is_alive()]
 
     def build_self_topo(self):
         id = "%s|%s|%s" % (self.site, self.tier, self.name)
         node = self._get_toponode(id)
         to = [x.short_remote_id() for x in self.connections.values() if not x.is_in() and x.live]
-        node.update(to)
+        node.update(to, datetime.now())
 
     def update_topology_safe(self, topo):
         try:
@@ -183,9 +201,12 @@ class APP(object):
             LOGGER.exception("Failed to process topology update")
 
     def update_topology(self, topo):
-        for fromid, tos in topo.items():
+        for node in topo:
+            fromid = node["from"]
+            target = node["target"]
+            ts = dateutil.parser.parse(node["timestamp"])
             toponode = self._get_toponode(fromid)
-            toponode.update(tos)
+            toponode.update(target, ts)
 
     @gen.coroutine
     def check(self, url):
@@ -210,6 +231,7 @@ class APP(object):
 
         except Exception as e:
             connection.message = repr(e)
+            connection.dead()
 
     @gen.coroutine
     def run(self):
@@ -235,6 +257,13 @@ class APP(object):
             LOGGER.info("Iteration done in %d time, sleeping %d" % (duration, sleeptime))
 
             yield gen.sleep(sleeptime)
+
+    def topology_dot(self):
+        def clean(ident):
+            return ident.replace("|", "_")
+        lines = ["""digraph {"""] + ["%s -> %s;" % (clean(tnode.fromid), clean(tonode))
+                                     for tnode in self._topology.values() for tonode in tnode.toids] + ["}"]
+        return "\n".join(lines)
 
 
 class AppHandler(tornado.web.RequestHandler):
@@ -267,8 +296,8 @@ class PingHandler(AppHandler):
 
         self.app.seen(mid["site"], mid["tier"], mid["name"], self.request.remote_ip)
         self.set_header("Content-Type", "application/json")
-        data = {"id": self.app.get_id(), "topology": self.app.topology()}
-        self.write(json_encode(data))
+        rdata = {"id": self.app.get_id(), "topology": self.app.topology()}
+        self.write(json_encode(rdata))
         self.app.update_topology_safe(data["topology"])
 
 
@@ -294,18 +323,96 @@ class TopoHandler(AppHandler):
         self.write(json_encode(self.app.topology()))
 
 
-def make_app():
-    app = APP("Site A", "Tier A", "Alpha", connect_to=["http://127.0.0.1:8888", "http://127.0.0.1:8887"])
+class DotHandler(AppHandler):
+
+    def __init__(self, application, request, app: APP, **kwargs):
+        super(AppHandler, self).__init__(application, request, **kwargs)
+        self.app = app
+
+    def get(self):
+        self.set_header("Content-Type", "text/plain")
+        self.write(self.app.topology_dot())
+
+
+class PngHandler(AppHandler):
+
+    def __init__(self, application, request, app: APP, **kwargs):
+        super(AppHandler, self).__init__(application, request, **kwargs)
+        self.app = app
+
+    @gen.coroutine
+    def get(self):
+        self.set_header("Content-Type", "image/png")
+        dot = self.app.topology_dot()
+        proc = tornado.process.Subprocess(["dot", "-Tpng"], stdin=tornado.process.Subprocess.STREAM, stdout=tornado.process.Subprocess.STREAM)
+        yield proc.stdin.write(dot.encode())
+        proc.stdin.close()
+        ret = yield proc.wait_for_exit()
+        png = yield proc.stdout.read_until_close()
+        self.write(png)
+
+
+def make_app(site, tier, name, connect_to, port=8888):
+    app = APP(site=site, tier=tier, name=name, connect_to=connect_to)
 
     tornado.ioloop.IOLoop.current().add_callback(app.run)
-    return tornado.web.Application([
+    app = tornado.web.Application([
         (r"/ping", PingHandler, {"app": app}),
         (r"/status", StatusHandler, {"app": app}),
-        (r"/topo", TopoHandler, {"app": app})
+        (r"/topo", TopoHandler, {"app": app}),
+        (r"/dot", DotHandler, {"app": app}),
+        (r"/png", PngHandler, {"app": app})
     ])
+
+    app.listen(port)
+    LOGGER.warn("Listening on port %d", port)
+
+
+log_levels = {
+    0: logging.ERROR,
+    1: logging.WARNING,
+    2: logging.INFO,
+    3: logging.DEBUG,
+    4: 2
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Networking test app')
+    parser.add_argument("-c", "--config", dest="config_file", help='config file', default="config.toml")
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                        help="Log level for messages going to the console. Default is only errors,"
+                        "-v warning, -vv info and -vvv debug and -vvvv trace")
+
+    normalformatter = logging.Formatter(fmt="%(levelname)-8s%(message)s")
+    stream = logging.StreamHandler()
+    stream.setLevel(logging.INFO)
+    stream.setFormatter(normalformatter)
+    logging.root.handlers = []
+    logging.root.addHandler(stream)
+    logging.root.setLevel(0)
+
+    options = parser.parse_args()
+
+    # set the log level
+    level = options.verbose
+    if level >= len(log_levels):
+        level = 3
+    stream.setLevel(log_levels[level])
+
+    cfg = toml.load(options.config_file)
+
+    def get_or(name, default):
+        if name in cfg:
+            return cfg[name]
+        else:
+            return default
+
+    make_app(get_or("site", "DEFAULTSITE"), get_or("tier", "DEFAULTTIER"),
+             get_or("name", "DEFAULTNAME"), connect_to=get_or("connect_to", []), port=int(get_or("port", 8888)))
+
+    tornado.ioloop.IOLoop.current().start()
 
 
 if __name__ == "__main__":
-    app = make_app()
-    app.listen(8888)
-    tornado.ioloop.IOLoop.current().start()
+    main()
