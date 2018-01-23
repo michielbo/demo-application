@@ -9,6 +9,7 @@ from tornado.escape import json_decode
 import dateutil.parser
 import argparse
 import toml
+import tempfile
 
 
 LOGGER = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ class Connection(object):
         return self.direction == DIRECTION_IN
 
     def is_alive(self):
-        return self.live and (datetime.now() - self.last_seen).total_seconds() < TIMEOUT_SECONDS 
+        return self.live and (datetime.now() - self.last_seen).total_seconds() < TIMEOUT_SECONDS
 
     def seen(self, remote_id="", message=""):
         self.last_seen = datetime.now()
@@ -239,7 +240,7 @@ class APP(object):
     def topology_dot(self):
         def clean(ident):
             return ident.replace("|", "_")
-        lines = ["""digraph {"""] + ["%s -> %s;" % (clean(tnode.fromid), clean(tonode))
+        lines = ["""digraph {"""] + ["\"%s\" -> \"%s\";" % (clean(tnode.fromid), clean(tonode))
                                      for tnode in self._topology.values() for tonode in tnode.toids] + ["}"]
         return "\n".join(lines)
 
@@ -323,13 +324,17 @@ class PngHandler(AppHandler):
         self.set_header("Content-Type", "image/png")
         self.set_header("Cache-Control:", "no-store")
         dot = self.app.topology_dot()
+
+        out = tempfile.NamedTemporaryFile()
         proc = tornado.process.Subprocess(["dot", "-Tpng"], stdin=tornado.process.Subprocess.STREAM,
-                                          stdout=tornado.process.Subprocess.STREAM)
+                                          stdout=out)
         yield proc.stdin.write(dot.encode())
         proc.stdin.close()
-        ret = yield proc.wait_for_exit()
-        png = yield proc.stdout.read_until_close()
-        self.write(png)
+        ret = yield proc.wait_for_exit(raise_error=False)
+        proc.uninitialize()
+        out.seek(0)
+
+        self.write(out.read())
 
 
 class IndexHandler(tornado.web.RequestHandler):
@@ -337,13 +342,13 @@ class IndexHandler(tornado.web.RequestHandler):
     @gen.coroutine
     def get(self):
         self.set_header("Content-Type", "text/html")
-        self.write("""<html> <head> 
+        self.write("""<html> <head>
 <script type="text/JavaScript">
 function TimedRefresh( t ) {
     setTimeout("location.reload(true);", t);
 }
 </script>
-</head> <body onload="JavaScript:TimedRefresh(5000);"> <img src="png"/> </body> </html>
+</head> <body onload="JavaScript:TimedRefresh(5000);"> <img src="png"/> </body></html>
 """)
 
 
