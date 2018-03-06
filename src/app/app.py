@@ -26,7 +26,7 @@ DIRECTION_OUT = "out"
 
 class Connection(object):
 
-    def __init__(self, myid, ip, direction):
+    def __init__(self, myid, ip, direction, location=""):
         self.id = myid
         self.target = ip
         self.direction = direction
@@ -34,12 +34,13 @@ class Connection(object):
         self.message = ""
         self.live = False
         self.remote_id = ""
+        self.location = location
 
     def is_in(self):
         return self.direction == DIRECTION_IN
 
     def is_alive(self):
-        return self.live and (datetime.now() - self.last_seen).total_seconds() < TIMEOUT_SECONDS 
+        return self.live and (datetime.now() - self.last_seen).total_seconds() < TIMEOUT_SECONDS
 
     def seen(self, remote_id="", message=""):
         self.last_seen = datetime.now()
@@ -60,7 +61,8 @@ class Connection(object):
             "live": self.is_alive(),
             "last_seen": self.last_seen,
             "message": self.message,
-            "id": self.remote_id
+            "id": self.remote_id,
+            "location": self.location
         }
 
     def short_remote_id(self):
@@ -70,21 +72,23 @@ class Connection(object):
 
 class TopoNode(object):
 
-    def __init__(self, fromid):
+    def __init__(self, fromid, location):
         self.fromid = fromid
         self.last_seen = datetime.now()
+        self.location = location
         self.toids = []
 
     def is_alive(self):
         return (datetime.now() - self.last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS
 
-    def update(self, toids, last_seen):
+    def update(self, toids, last_seen, location):
         # update if newer and live
         if last_seen >= self.last_seen:
             if (datetime.now() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
                 LOGGER.debug("updating topo node %s for new %s", self.fromid, toids)
                 self.toids = toids
                 self.last_seen = last_seen
+                self.location = location
             else:
                 LOGGER.debug("Not updating node %s for new %s due to stale data", self.fromid, toids)
         else:
@@ -94,7 +98,7 @@ class TopoNode(object):
         return (datetime.now() - self.last_seen).total_seconds()
 
     def to_dict(self):
-        return {"from": self.fromid, "target": self.toids, "timestamp": self.last_seen.isoformat()}
+        return {"from": self.fromid, "location": self.location, "target": self.toids, "timestamp": self.last_seen.isoformat()}
 
 
 def custom_json_encoder(o):
@@ -118,11 +122,12 @@ def json_encode(value):
 
 class APP(object):
 
-    def __init__(self, site, tier, name, port=8888, connect_to=[]):
+    def __init__(self, site, tier, name, location="", port=8888, connect_to=[]):
         self.site = site
         self.tier = tier
         self.name = name
         self.port = port
+        self.location = location
         self.connect_to = connect_to
 
         self.connections = {}
@@ -158,11 +163,11 @@ class APP(object):
     def get_id(self):
         return {"site": self.site, "tier": self.tier, "name": self.name}
 
-    def _get_toponode(self, myid):
+    def _get_toponode(self, myid, location):
         if myid in self._topology:
             connection = self._topology[myid]
         else:
-            connection = TopoNode(myid)
+            connection = TopoNode(myid, location)
             self._topology[myid] = connection
         return connection
 
@@ -171,9 +176,9 @@ class APP(object):
 
     def build_self_topo(self):
         id = "%s|%s|%s" % (self.site, self.tier, self.name)
-        node = self._get_toponode(id)
+        node = self._get_toponode(id, self.location)
         to = [x.short_remote_id() for x in self.connections.values() if not x.is_in() and x.is_alive()]
-        node.update(to, datetime.now())
+        node.update(to, datetime.now(), self.location)
 
     def update_topology_safe(self, topo):
         try:
@@ -185,9 +190,10 @@ class APP(object):
         for node in topo:
             fromid = node["from"]
             target = node["target"]
+            location = node["location"]
             ts = dateutil.parser.parse(node["timestamp"])
-            toponode = self._get_toponode(fromid)
-            toponode.update(target, ts)
+            toponode = self._get_toponode(fromid, location)
+            toponode.update(target, ts, location)
 
     @gen.coroutine
     def check(self, url):
@@ -347,8 +353,8 @@ function TimedRefresh( t ) {
 """)
 
 
-def make_app(site, tier, name, connect_to, port=8888):
-    app = APP(site=site, tier=tier, name=name, connect_to=connect_to)
+def make_app(site, tier, name, location, connect_to, port=8888):
+    app = APP(site=site, tier=tier, location=location, name=name, connect_to=connect_to)
 
     tornado.ioloop.IOLoop.current().add_callback(app.run)
     app = tornado.web.Application([
@@ -407,7 +413,8 @@ def main():
             return default
 
     make_app(get_or("site", "DEFAULTSITE"), get_or("tier", "DEFAULTTIER"),
-             get_or("name", "DEFAULTNAME"), connect_to=get_or("connect_to", []), port=int(get_or("port", 8888)))
+             get_or("name", "DEFAULTNAME"), location=get_or("location", ""),
+             connect_to=get_or("connect_to", []), port=int(get_or("port", 8888)))
 
     tornado.ioloop.IOLoop.current().start()
 
