@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <style>
+    #map {
+      height: 400px;
+      width: 100%;
+    }
+  </style>
+</head>
+
+<body>
+  <h3>My Google Maps Demo</h3>
+  <div id="map"></div>
+  <script>
+    function initMap() {
+      var markers = {}
+      var bounds = new google.maps.LatLngBounds();
+      var geocoder = new google.maps.Geocoder();
+      var map = new google.maps.Map(document.getElementById('map'));
+
+      function add_marker(color, place) {
+        console.log(color, place)
+        if (place in markers) {
+          if(markers[place] != ""){
+            markers[place].setIcon('http://maps.google.com/mapfiles/ms/icons/'+color+'-dot.png')
+          }
+        } else {
+          markers[place] = ""
+          geocoder.geocode({ 'address': place }, function (results, status) {
+            if (status == 'OK') {
+              var location = results[0].geometry.location
+              var marker = new google.maps.Marker({
+                map: map,
+                position: location,
+                icon: 'http://maps.google.com/mapfiles/ms/icons/'+color+'-dot.png'
+              });
+              markers[place] = marker
+              bounds.extend(location)
+              map.fitBounds(bounds);
+            } else {
+              alert('Geocode was not successful for the following reason: ' + status);
+            }
+          })
+        }
+      }
+
+      function load() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', 'topo');
+        xhr.onload = function () {
+            var topo = JSON.parse(xhr.responseText);
+            for (var marker in markers){
+              marker = markers[marker]
+              marker.setIcon('http://maps.google.com/mapfiles/ms/icons/msmarker.shadow.png')
+            }
+
+            for(var tnode in topo){
+              tnode = topo[tnode]
+              add_marker(tnode.color, tnode.location)
+            }
+        };
+        xhr.send();
+      }
+
+      load()
+      var intervalID = setInterval(load, 5000);
+
+
+    }
+  </script>
+  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBh1IcUvsdXIZZLBlKBEdchB88h96RxM5E&callback=initMap">
+  </script>
+</body>
+
+</html>
