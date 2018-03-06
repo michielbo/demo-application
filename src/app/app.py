@@ -246,7 +246,13 @@ class APP(object):
         def clean(ident):
             return ident.replace("|", "_")
         lines = ["""digraph {"""] + ["%s -> %s;" % (clean(tnode.fromid), clean(tonode))
-                                     for tnode in self._topology.values() for tonode in tnode.toids] + ["}"]
+                                     for tnode in self._topology.values() for tonode in tnode.toids]
+
+        node_location = {clean(tnode.fromid): tnode.location for tnode in self._topology.values()}
+
+        lines += ["%s [label=\"%s %s\"]" % (k, k, v) for k, v in node_location.items()]
+        lines += ["}"]
+
         return "\n".join(lines)
 
 
