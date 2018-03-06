@@ -36,6 +36,7 @@ class Connection(object):
         self.live = False
         self.remote_id = ""
         self.location = location
+        self.latency = -1
 
     def is_in(self):
         return self.direction == DIRECTION_IN
@@ -43,11 +44,12 @@ class Connection(object):
     def is_alive(self):
         return self.live and (datetime.now() - self.last_seen).total_seconds() < TIMEOUT_SECONDS
 
-    def seen(self, remote_id="", message=""):
+    def seen(self, remote_id="", message="", latency=-1):
         self.last_seen = datetime.now()
         self.live = True
         self.message = message
         self.remote_id = remote_id
+        self.latency = latency
 
     def dead(self):
         self.live = False
@@ -63,7 +65,8 @@ class Connection(object):
             "last_seen": self.last_seen,
             "message": self.message,
             "id": self.remote_id,
-            "location": self.location
+            "location": self.location,
+            "latency": self.latency
         }
 
     def short_remote_id(self):
@@ -77,17 +80,19 @@ class TopoNode(object):
         self.fromid = fromid
         self.last_seen = datetime.now()
         self.location = location
+        self.latencies = {}
         self.toids = []
 
     def is_alive(self):
         return (datetime.now() - self.last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS
 
-    def update(self, toids, last_seen, location):
+    def update(self, toids, latencies, last_seen, location):
         # update if newer and live
         if last_seen >= self.last_seen:
             if (datetime.now() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
                 LOGGER.debug("updating topo node %s for new %s", self.fromid, toids)
                 self.toids = toids
+                self.latencies = latencies
                 self.last_seen = last_seen
                 self.location = location
             else:
@@ -99,7 +104,7 @@ class TopoNode(object):
         return (datetime.now() - self.last_seen).total_seconds()
 
     def to_dict(self):
-        return {"from": self.fromid, "location": self.location, "target": self.toids, "timestamp": self.last_seen.isoformat()}
+        return {"from": self.fromid, "location": self.location, "latency": self.latencies, "target": self.toids, "timestamp": self.last_seen.isoformat()}
 
 
 def custom_json_encoder(o):
@@ -146,14 +151,14 @@ class APP(object):
             self.connections[myid] = connection
         return connection
 
-    def seen(self, site, tier, name, ip, direction=DIRECTION_IN):
+    def seen(self, site, tier, name, ip, direction=DIRECTION_IN, latency=-1):
         myid = (site, tier, name, direction)
 
         LOGGER.info("Incoming connection from %s %s %s (%s)", site, tier, name, ip)
 
         connection = self._get_connection(ip, direction, myid)
 
-        connection.seen()
+        connection.seen(latency)
 
     def status(self):
         return {
@@ -178,8 +183,10 @@ class APP(object):
     def build_self_topo(self):
         id = "%s|%s|%s" % (self.site, self.tier, self.name)
         node = self._get_toponode(id, self.location)
-        to = [x.short_remote_id() for x in self.connections.values() if not x.is_in() and x.is_alive()]
-        node.update(to, datetime.now(), self.location)
+        outgoing = [x for x in self.connections.values() if not x.is_in() and x.is_alive()]
+        to = [x.short_remote_id() for x in outgoing]
+        target_latency = {x.short_remote_id(): x.latency for x in outgoing}
+        node.update(to, target_latency, datetime.now(), self.location)
 
     def update_topology_safe(self, topo):
         try:
@@ -192,9 +199,10 @@ class APP(object):
             fromid = node["from"]
             target = node["target"]
             location = node["location"]
+            latency = node["latency"]
             ts = dateutil.parser.parse(node["timestamp"])
             toponode = self._get_toponode(fromid, location)
-            toponode.update(target, ts, location)
+            toponode.update(target, latency, ts, location)
 
     @gen.coroutine
     def check(self, url):
@@ -214,7 +222,7 @@ class APP(object):
 
             topo = data["topology"]
 
-            connection.seen(message="", remote_id=data["id"])
+            connection.seen(message="", remote_id=data["id"], latency=response.request_time)
             self.update_topology_safe(topo)
 
         except Exception as e:
@@ -247,16 +255,20 @@ class APP(object):
         def clean(ident):
             return ident.replace("|", "_").replace(" ", "_")
         lines = ["""digraph {"""]
-        lines += ["%s -> %s;" % (clean(tnode.fromid), clean(tonode))
-                  for tnode in self._topology.values() for tonode in tnode.toids]
 
-        node_location = {clean(tnode.fromid): tnode.location for tnode in self._topology.values()}
+        def render_edge(fromnode, tonode, latency):
+            return "%s -> %s [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency*1000)
+
+        lines += [render_edge(tnode.fromid, tonode, latency)
+                  for tnode in self._topology.values() for tonode, latency in tnode.latencies.items()]
+
+        node_location = {tnode: tnode.location for tnode in self._topology.values()}
 
         location_node = groupby(sorted(node_location.items(), key=lambda x: x[1]), lambda x: x[1])
         location_node = [(k, [l[0] for l in g]) for k, g in location_node]
 
         def render_node(node):
-            return "%s;" % node
+            return "%s;" % clean(node.fromid)
 
         def render_nodes(nodes):
             return "\n".join([render_node(node) for node in nodes])
