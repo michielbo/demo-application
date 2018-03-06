@@ -9,6 +9,7 @@ from tornado.escape import json_decode
 import dateutil.parser
 import argparse
 import toml
+from itertools import groupby
 
 
 LOGGER = logging.getLogger(__name__)
@@ -244,13 +245,25 @@ class APP(object):
 
     def topology_dot(self):
         def clean(ident):
-            return ident.replace("|", "_")
-        lines = ["""digraph {"""] + ["%s -> %s;" % (clean(tnode.fromid), clean(tonode))
-                                     for tnode in self._topology.values() for tonode in tnode.toids]
+            return ident.replace("|", "_").replace(" ", "_")
+        lines = ["""digraph {"""]
+        lines += ["%s -> %s;" % (clean(tnode.fromid), clean(tonode))
+                  for tnode in self._topology.values() for tonode in tnode.toids]
 
         node_location = {clean(tnode.fromid): tnode.location for tnode in self._topology.values()}
 
-        lines += ["%s [label=\"%s %s\"]" % (k, k, v) for k, v in node_location.items()]
+        location_node = groupby(sorted(node_location.items(), key=lambda x: x[1]), lambda x: x[1])
+        location_node = [(k, [l[0] for l in g]) for k, g in location_node]
+
+        def render_node(node):
+            return "%s;" % node
+
+        def render_nodes(nodes):
+            return "\n".join([render_node(node) for node in nodes])
+
+        lines += ["subgraph cluster_%s { \n %s \n label=\"%s\";\n}" %
+                  (clean(location), render_nodes(nodes), location) for (location, nodes) in location_node]
+
         lines += ["}"]
 
         return "\n".join(lines)
