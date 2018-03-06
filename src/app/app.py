@@ -10,6 +10,8 @@ import dateutil.parser
 import argparse
 import toml
 from itertools import groupby
+from urllib.parse import urlencode
+import urllib
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,7 +29,7 @@ DIRECTION_OUT = "out"
 
 class Connection(object):
 
-    def __init__(self, myid, ip, direction, location=""):
+    def __init__(self, myid, ip, direction, location="", color=""):
         self.id = myid
         self.target = ip
         self.direction = direction
@@ -37,6 +39,7 @@ class Connection(object):
         self.remote_id = ""
         self.location = location
         self.latency = -1
+        self.color = color
 
     def is_in(self):
         return self.direction == DIRECTION_IN
@@ -66,7 +69,8 @@ class Connection(object):
             "message": self.message,
             "id": self.remote_id,
             "location": self.location,
-            "latency": self.latency
+            "latency": self.latency,
+            "color": self.color
         }
 
     def short_remote_id(self):
@@ -76,17 +80,18 @@ class Connection(object):
 
 class TopoNode(object):
 
-    def __init__(self, fromid, location):
+    def __init__(self, fromid, location, color):
         self.fromid = fromid
         self.last_seen = datetime.now()
         self.location = location
         self.latencies = {}
         self.toids = []
+        self.color = color
 
     def is_alive(self):
         return (datetime.now() - self.last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS
 
-    def update(self, toids, latencies, last_seen, location):
+    def update(self, toids, latencies, last_seen, location, color):
         # update if newer and live
         if last_seen >= self.last_seen:
             if (datetime.now() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
@@ -95,6 +100,7 @@ class TopoNode(object):
                 self.latencies = latencies
                 self.last_seen = last_seen
                 self.location = location
+                self.color = color
             else:
                 LOGGER.debug("Not updating node %s for new %s due to stale data", self.fromid, toids)
         else:
@@ -104,7 +110,7 @@ class TopoNode(object):
         return (datetime.now() - self.last_seen).total_seconds()
 
     def to_dict(self):
-        return {"from": self.fromid, "location": self.location, "latency": self.latencies, "target": self.toids, "timestamp": self.last_seen.isoformat()}
+        return {"from": self.fromid, "location": self.location, "color": self.color, "latency": self.latencies, "target": self.toids, "timestamp": self.last_seen.isoformat()}
 
 
 def custom_json_encoder(o):
@@ -128,18 +134,21 @@ def json_encode(value):
 
 class APP(object):
 
-    def __init__(self, site, tier, name, location="", port=8888, connect_to=[]):
+    def __init__(self, site, tier, name, location="", color="", port=8888, connect_to=[], colornodes=False):
         self.site = site
         self.tier = tier
         self.name = name
         self.port = port
         self.location = location
+        self.color = color
         self.connect_to = connect_to
 
         self.connections = {}
 
         self._topology = {}
         self.self_topology = {}
+
+        self.colornodes = colornodes
 
         self.http_client = AsyncHTTPClient()
 
@@ -169,11 +178,11 @@ class APP(object):
     def get_id(self):
         return {"site": self.site, "tier": self.tier, "name": self.name}
 
-    def _get_toponode(self, myid, location):
+    def _get_toponode(self, myid, location, color):
         if myid in self._topology:
             connection = self._topology[myid]
         else:
-            connection = TopoNode(myid, location)
+            connection = TopoNode(myid, location, color)
             self._topology[myid] = connection
         return connection
 
@@ -182,11 +191,11 @@ class APP(object):
 
     def build_self_topo(self):
         id = "%s|%s|%s" % (self.site, self.tier, self.name)
-        node = self._get_toponode(id, self.location)
+        node = self._get_toponode(id, self.location, self.color)
         outgoing = [x for x in self.connections.values() if not x.is_in() and x.is_alive()]
         to = [x.short_remote_id() for x in outgoing]
         target_latency = {x.short_remote_id(): x.latency for x in outgoing}
-        node.update(to, target_latency, datetime.now(), self.location)
+        node.update(to, target_latency, datetime.now(), self.location, self.color)
 
     def update_topology_safe(self, topo):
         try:
@@ -200,9 +209,10 @@ class APP(object):
             target = node["target"]
             location = node["location"]
             latency = node["latency"]
+            color = node["color"]
             ts = dateutil.parser.parse(node["timestamp"])
-            toponode = self._get_toponode(fromid, location)
-            toponode.update(target, latency, ts, location)
+            toponode = self._get_toponode(fromid, location, color=color)
+            toponode.update(target, latency, ts, location, color=color)
 
     @gen.coroutine
     def check(self, url):
@@ -257,7 +267,7 @@ class APP(object):
         lines = ["""digraph {"""]
 
         def render_edge(fromnode, tonode, latency):
-            return "%s -> %s [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency*1000)
+            return "%s -> %s [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency * 1000)
 
         lines += [render_edge(tnode.fromid, tonode, latency)
                   for tnode in self._topology.values() for tonode, latency in tnode.latencies.items()]
@@ -268,7 +278,10 @@ class APP(object):
         location_node = [(k, [l[0] for l in g]) for k, g in location_node]
 
         def render_node(node):
-            return "%s;" % clean(node.fromid)
+            if node.color != "" and self.colornodes:
+                return "%s [color=%s];" % (clean(node.fromid), node.color)
+            else:
+                return "%s;" % clean(node.fromid)
 
         def render_nodes(nodes):
             return "\n".join([render_node(node) for node in nodes])
@@ -279,6 +292,16 @@ class APP(object):
         lines += ["}"]
 
         return "\n".join(lines)
+
+    def get_location_color(self):
+        pairs = [(tnode.location, tnode.color) for tnode in self._topology.values()]
+        lc = {}
+        for l, c in pairs:
+            if l not in lc:
+                lc[l] = c
+            elif lc[l] != c:
+                LOGGER.warn("Same location with two colors: %s %s %s" % (l, lc[l], c))
+        return lc
 
 
 class AppHandler(tornado.web.RequestHandler):
@@ -349,6 +372,41 @@ class DotHandler(AppHandler):
         self.write(self.app.topology_dot())
 
 
+smaptamples = """<html> <head> 
+<script type="text/JavaScript">
+function TimedRefresh( t ) {
+    setTimeout("location.reload(true);", t);
+}
+</script>
+</head> <body onload="JavaScript:TimedRefresh(5000);"> <img src="%s"/> </body> </html>
+"""
+
+
+class StaticMapHandler(AppHandler):
+
+    def __init__(self, application, request, app: APP, **kwargs):
+        super(AppHandler, self).__init__(application, request, **kwargs)
+        self.app = app
+
+    def get(self):
+        location_color = self.app.get_location_color()
+
+        color_location = groupby(sorted(location_color.items(), key=lambda x: x[1]), lambda x: x[1])
+        color_location = [(k, [v[0] for v in locations]) for (k, locations) in color_location]
+
+        def marker_for_color(color, locations):
+            return ("markers", ("color:%s|" % color) + "|".join(locations))
+
+        markers = [marker_for_color(k, v) for k, v in color_location]
+
+        parts = [("size", "640x640"), ("key", "AIzaSyAxE4078fMnhyC1z6xYBrlbdT4JcEdseNY")] + markers
+        url = "https://maps.googleapis.com/maps/api/staticmap?"
+        url = url + urlencode(parts)
+
+        self.set_header("Content-Type", "text/html")
+        self.write(smaptamples % url)
+
+
 class PngHandler(AppHandler):
 
     def __init__(self, application, request, app: APP, **kwargs):
@@ -384,8 +442,97 @@ function TimedRefresh( t ) {
 """)
 
 
-def make_app(site, tier, name, location, connect_to, port=8888):
-    app = APP(site=site, tier=tier, location=location, name=name, connect_to=connect_to)
+dynamap = """
+<!DOCTYPE html>
+<html>
+
+<head>
+  <style>
+    #map {
+      height: 400px;
+      width: 100%;
+    }
+  </style>
+</head>
+
+<body>
+  <h3>My Google Maps Demo</h3>
+  <div id="map"></div>
+  <script>
+    function initMap() {
+      var markers = {}
+      var bounds = new google.maps.LatLngBounds();
+      var geocoder = new google.maps.Geocoder();
+      var map = new google.maps.Map(document.getElementById('map'));
+
+      function add_marker(color, place) {
+        console.log(color, place)
+        if (place in markers) {
+          if(markers[place] != ""){
+            markers[place].setIcon('http://maps.google.com/mapfiles/ms/icons/'+color+'-dot.png')
+          }
+        } else {
+          markers[place] = ""
+          geocoder.geocode({ 'address': place }, function (results, status) {
+            if (status == 'OK') {
+              var location = results[0].geometry.location
+              var marker = new google.maps.Marker({
+                map: map,
+                position: location,
+                icon: 'http://maps.google.com/mapfiles/ms/icons/'+color+'-dot.png'
+              });
+              markers[place] = marker
+              bounds.extend(location)
+              map.fitBounds(bounds);
+            } else {
+              alert('Geocode was not successful for the following reason: ' + status);
+            }
+          })
+        }
+      }
+
+      function load() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', 'topo');
+        xhr.onload = function () {
+            var topo = JSON.parse(xhr.responseText);
+            for (var marker in markers){
+              marker = markers[marker]
+              marker.setIcon('http://maps.google.com/mapfiles/ms/icons/msmarker.shadow.png')
+            }
+
+            for(var tnode in topo){
+              tnode = topo[tnode]
+              add_marker(tnode.color, tnode.location)
+            }
+        };
+        xhr.send();
+      }
+
+      load()
+      var intervalID = setInterval(load, 5000);
+
+
+    }
+  </script>
+  <script async defer src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBh1IcUvsdXIZZLBlKBEdchB88h96RxM5E&callback=initMap">
+  </script>
+</body>
+
+</html>
+"""
+
+
+class MapHandler(tornado.web.RequestHandler):
+
+    @gen.coroutine
+    def get(self):
+        self.set_header("Content-Type", "text/html")
+        self.write(dynamap)
+
+
+def make_app(site, tier, name, location, color, connect_to, port=8888, colornodes=False):
+    app = APP(site=site, tier=tier, location=location, color=color, name=name, connect_to=connect_to, colornodes=colornodes)
 
     tornado.ioloop.IOLoop.current().add_callback(app.run)
     app = tornado.web.Application([
@@ -394,6 +541,8 @@ def make_app(site, tier, name, location, connect_to, port=8888):
         (r"/topo", TopoHandler, {"app": app}),
         (r"/dot", DotHandler, {"app": app}),
         (r"/png", PngHandler, {"app": app}),
+        (r"/smap", StaticMapHandler, {"app": app}),
+        (r"/map", MapHandler),
         (r"/", IndexHandler),
         (r"/index.html", IndexHandler)
 
@@ -418,7 +567,8 @@ def main():
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help="Log level for messages going to the console. Default is only errors,"
                         "-v warning, -vv info and -vvv debug and -vvvv trace")
-
+    parser.add_argument("--colornodes", dest="colornodes",
+                        help='enable to render nodes in dot in the color inidicated in the config file of that node', action='store_true')
     normalformatter = logging.Formatter(fmt="%(levelname)-8s%(message)s")
     stream = logging.StreamHandler()
     stream.setLevel(logging.INFO)
@@ -445,7 +595,9 @@ def main():
 
     make_app(get_or("site", "DEFAULTSITE"), get_or("tier", "DEFAULTTIER"),
              get_or("name", "DEFAULTNAME"), location=get_or("location", ""),
-             connect_to=get_or("connect_to", []), port=int(get_or("port", 8888)))
+             color=get_or("color", ""),
+             connect_to=get_or("connect_to", []), port=int(get_or("port", 8888)),
+             colornodes=get_or("colornodes", False))
 
     tornado.ioloop.IOLoop.current().start()
 
