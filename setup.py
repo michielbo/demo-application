@@ -4,7 +4,7 @@ from distutils.core import setup
 from setuptools import find_packages
 
 setup(name='app',
-      version='1.4',
+      version='1.5',
       description='Alternate Presentation Program',
       author='Wouter De Borger',
       author_email='wouter.deborger@inmanta.com',

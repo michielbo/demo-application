@@ -269,7 +269,7 @@ class APP(object):
         lines = ["""digraph {"""]
 
         def render_edge(fromnode, tonode, latency):
-            return "%s -> %s [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency * 1000)
+            return "\"%\"s -> \"%s\" [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency * 1000)
 
         lines += [render_edge(tnode.fromid, tonode, latency)
                   for tnode in self._topology.values() for tonode, latency in tnode.latencies.items()]
@@ -281,14 +281,14 @@ class APP(object):
 
         def render_node(node):
             if node.color != "" and self.colornodes:
-                return "%s [color=%s];" % (clean(node.fromid), node.color)
+                return "\"%s\" [color=%s];" % (clean(node.fromid), node.color)
             else:
-                return "%s;" % clean(node.fromid)
+                return "\"%s\";" % clean(node.fromid)
 
         def render_nodes(nodes):
             return "\n".join([render_node(node) for node in nodes])
 
-        lines += ["subgraph cluster_%s { \n %s \n label=\"%s\";\n}" %
+        lines += ["subgraph \"cluster_%s\" { \n %s \n label=\"%s\";\n}" %
                   (clean(location), render_nodes(nodes), location) for (location, nodes) in location_node]
 
         lines += ["}"]
