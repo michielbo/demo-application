@@ -1,5 +1,5 @@
 site="S1"
-tier="T1"
+tier="T2"
 name="Node3"
 port=8886
 connect_to=["http://127.0.0.1:8885"]
