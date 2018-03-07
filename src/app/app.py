@@ -475,7 +475,7 @@ dynamap = """
 <head>
   <style>
     #map {
-      height: 100%;
+      height: 800px;
       width: 100%;
     }
   </style>
