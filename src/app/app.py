@@ -269,7 +269,7 @@ class APP(object):
         lines = ["""digraph {"""]
 
         def render_edge(fromnode, tonode, latency):
-            return "\"%\"s -> \"%s\" [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency * 1000)
+            return "\"%s\" -> \"%s\" [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency * 1000)
 
         lines += [render_edge(tnode.fromid, tonode, latency)
                   for tnode in self._topology.values() for tonode, latency in tnode.latencies.items()]
