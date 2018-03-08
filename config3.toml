@@ -5,3 +5,4 @@ port=8886
 connect_to=["http://127.0.0.1:8885"]
 location="Antwerpen"
 color="blue"
+renderdelta = 10

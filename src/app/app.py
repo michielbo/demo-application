@@ -135,15 +135,18 @@ def json_encode(value):
 
 class APP(object):
 
-    def __init__(self, site, tier, name, location="", color="", port=8888, connect_to=[], colornodes=False, fastest=False):
+    def __init__(self, site, tier, name, location="", color="", port=8888, connect_to=[], colornodes=False, fastest=False, link_delta=0):
         self.site = site
         self.tier = tier
         self.name = name
         self.port = port
         self.location = location
         self.color = color
-        self.fastest = fastest
         self.connect_to = connect_to
+
+        self.fastest = fastest
+        self.link_delta = link_delta/1000
+        self.node_tier_edge_cache = {}
 
         self.connections = {}
 
@@ -287,12 +290,22 @@ class APP(object):
             lines += [render_edge(fromnode, tonode, latency) for fromnode, fromtier, tonode, totier,
                       latency in node_tier_to_tier_latency if fromtier == totier]
             #not same
-            node_totier_tonode_latency = [(fromnode, totier, tonode, latency) for fromnode, fromtier,
+
+            def get_latency(fromnode, totier, tonode, latency):
+                if (fromnode, totier) in self.node_tier_edge_cache and self.node_tier_edge_cache[(fromnode, totier)] == tonode:
+                    return latency - self.link_delta
+                return latency
+
+            node_totier_tonode_latency = [(fromnode, totier, tonode, latency, get_latency(fromnode, totier, tonode, latency)) for fromnode, fromtier,
                                           tonode, totier, latency in node_tier_to_tier_latency if fromtier != totier]
             node_totier__tonode_latency = groupby(
                 sorted(node_totier_tonode_latency, key=lambda t: (t[0], t[1])), lambda t: (t[0], t[1]))
-            node_totier__tonode_latency = [(node[0], sorted(i, key=lambda x:x[3])) for node, i in node_totier__tonode_latency]
-            lines += [render_edge(fromnode, nl[0][2], nl[0][3]) for fromnode,nl in node_totier__tonode_latency]
+
+            node_totier__tonode_latency = [(node, sorted(i, key=lambda x:x[4])) for node, i in node_totier__tonode_latency]
+
+            self.node_tier_edge_cache = {(fromnode[0], fromnode[1]): nl[0][2] for fromnode, nl in node_totier__tonode_latency}
+
+            lines += [render_edge(fromnode[0], nl[0][2], nl[0][3]) for fromnode, nl in node_totier__tonode_latency]
 
         node_location = {tnode: tnode.location for tnode in self._topology.values()}
 
@@ -557,9 +570,9 @@ class MapHandler(tornado.web.RequestHandler):
         self.write(dynamap)
 
 
-def make_app(site, tier, name, location, color, connect_to, port=8888, colornodes=False, fastest=False):
+def make_app(site, tier, name, location, color, connect_to, port=8888, colornodes=False, fastest=False, link_delta=False):
     app = APP(site=site, tier=tier, location=location, color=color, name=name,
-              connect_to=connect_to, colornodes=colornodes, fastest=fastest)
+              connect_to=connect_to, colornodes=colornodes, fastest=fastest, link_delta=link_delta)
 
     tornado.ioloop.IOLoop.current().add_callback(app.run)
     app = tornado.web.Application([
@@ -626,7 +639,9 @@ def main():
              get_or("name", "DEFAULTNAME"), location=get_or("location", ""),
              color=get_or("color", ""),
              connect_to=get_or("connect_to", []), port=int(get_or("port", 8888)),
-             colornodes=get_or("colornodes", options.colornodes), fastest=options.fastest)
+             colornodes=get_or("colornodes", options.colornodes),
+             fastest=get_or("fastest", options.fastest),
+             link_delta=get_or("renderdelta", 0))
 
     tornado.ioloop.IOLoop.current().start()
 
