@@ -46,10 +46,10 @@ class Connection(object):
         return self.direction == DIRECTION_IN
 
     def is_alive(self):
-        return self.live and (datetime.now() - self.last_seen).total_seconds() < TIMEOUT_SECONDS
+        return self.live and (datetime.utcnow() - self.last_seen).total_seconds() < TIMEOUT_SECONDS
 
     def seen(self, remote_id="", message="", latency=-1):
-        self.last_seen = datetime.now()
+        self.last_seen = datetime.utcnow()
         self.live = True
         self.message = message
         self.remote_id = remote_id
@@ -59,7 +59,7 @@ class Connection(object):
         self.live = False
 
     def age(self):
-        return (datetime.now() - self.last_seen).total_seconds()
+        return (datetime.utcnow() - self.last_seen).total_seconds()
 
     def to_dict(self):
         return {
@@ -83,19 +83,19 @@ class TopoNode(object):
 
     def __init__(self, fromid, location, color):
         self.fromid = fromid
-        self.last_seen = datetime.now()
+        self.last_seen = datetime.utcnow()
         self.location = location
         self.latencies = {}
         self.toids = []
         self.color = color
 
     def is_alive(self):
-        return (datetime.now() - self.last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS
+        return (datetime.utcnow() - self.last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS
 
     def update(self, toids, latencies, last_seen, location, color):
         # update if newer and live
         if last_seen >= self.last_seen:
-            if (datetime.now() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
+            if (datetime.utcnow() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
                 LOGGER.debug("updating topo node %s for new %s", self.fromid, toids)
                 self.toids = toids
                 self.latencies = latencies
@@ -108,7 +108,7 @@ class TopoNode(object):
             LOGGER.debug("Not updating node %s for new %s due to not newer %s", self.fromid, toids, last_seen)
 
     def age(self):
-        return (datetime.now() - self.last_seen).total_seconds()
+        return (datetime.utcnow() - self.last_seen).total_seconds()
 
     def to_dict(self):
         return {"from": self.fromid, "location": self.location, "color": self.color, "latency": self.latencies, "target": self.toids, "timestamp": self.last_seen.isoformat()}
@@ -196,7 +196,7 @@ class APP(object):
         outgoing = [x for x in self.connections.values() if not x.is_in() and x.is_alive()]
         to = [x.short_remote_id() for x in outgoing]
         target_latency = {x.short_remote_id(): x.latency for x in outgoing}
-        node.update(to, target_latency, datetime.now(), self.location, self.color)
+        node.update(to, target_latency, datetime.utcnow(), self.location, self.color)
 
     def update_topology_safe(self, topo):
         try:
