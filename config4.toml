@@ -1,7 +1,7 @@
 site="S1"
-tier="T1"
+tier="T2"
 name="Node4"
 port=8885
-connect_to=["http://127.0.0.1:8888"]
+connect_to=["http://127.0.0.1:8888","http://127.0.0.1:8887"]
 location = "Tielt Winge"
 color="orange"
