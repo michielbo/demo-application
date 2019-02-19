@@ -1,9 +1,12 @@
+# Copyright Inmanta 2018
+# Contact: code@inmanta.com
+# License: Apache 2.0 License
 import tornado.ioloop
 import tornado.web
 import logging
 from datetime import datetime
 import json
-from tornado import gen, ioloop
+from tornado import gen, routing
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 from tornado.escape import json_decode
 import dateutil.parser
@@ -12,8 +15,11 @@ import toml
 import tempfile
 from itertools import groupby
 from urllib.parse import urlencode
-import urllib
+import asyncio
 
+from typing import Tuple, Dict, Any, List, TypeVar, cast, Union, Iterator
+
+OptT = TypeVar("OptT")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,39 +35,40 @@ DIRECTION_OUT = "out"
 
 
 class Connection(object):
+    last_seen: datetime
 
-    def __init__(self, myid, ip, direction, location="", color=""):
+    def __init__(self, myid: Tuple[str, str, str, str], ip: str, direction: str, location: str = "", color: str = "") -> None:
         self.id = myid
         self.target = ip
         self.direction = direction
-        self.last_seen = None
         self.message = ""
         self.live = False
-        self.remote_id = ""
-        self.location = location
-        self.latency = -1
-        self.color = color
 
-    def is_in(self):
+        self.location = location
+        self.latency: float = -1
+        self.color = color
+        self.remote_id: Dict[str, str] = {}
+
+    def is_in(self) -> bool:
         return self.direction == DIRECTION_IN
 
-    def is_alive(self):
+    def is_alive(self) -> bool:
         return self.live and (datetime.utcnow() - self.last_seen).total_seconds() < TIMEOUT_SECONDS
 
-    def seen(self, remote_id="", message="", latency=-1):
+    def seen(self, remote_id: Dict[str, str]={}, message: str = "", latency: float = -1) -> None:
         self.last_seen = datetime.utcnow()
         self.live = True
         self.message = message
         self.remote_id = remote_id
         self.latency = latency
 
-    def dead(self):
+    def dead(self) -> None:
         self.live = False
 
-    def age(self):
+    def age(self) -> float:
         return (datetime.utcnow() - self.last_seen).total_seconds()
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "direction": self.direction,
             "target": self.target,
@@ -71,28 +78,27 @@ class Connection(object):
             "id": self.remote_id,
             "location": self.location,
             "latency": self.latency,
-            "color": self.color
+            "color": self.color,
         }
 
-    def short_remote_id(self):
+    def short_remote_id(self) -> str:
         x = self.remote_id
         return "%s|%s|%s" % (x["site"], x["tier"], x["name"])
 
 
 class TopoNode(object):
-
-    def __init__(self, fromid, location, color):
+    def __init__(self, fromid: str, location: str, color: str) -> None:
         self.fromid = fromid
-        self.last_seen = datetime.utcnow()
+        self.last_seen: datetime = datetime.utcnow()
         self.location = location
-        self.latencies = {}
-        self.toids = []
+        self.latencies: Dict[str, float] = {}
+        self.toids: List[str] = []
         self.color = color
 
-    def is_alive(self):
+    def is_alive(self) -> bool:
         return (datetime.utcnow() - self.last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS
 
-    def update(self, toids, latencies, last_seen, location, color):
+    def update(self, toids: List[str], latencies: Dict[str, float], last_seen: datetime, location: str, color: str) -> None:
         # update if newer and live
         if last_seen >= self.last_seen:
             if (datetime.utcnow() - last_seen).total_seconds() < TOPOLOGY_TIMEOUT_SECONDS:
@@ -107,19 +113,26 @@ class TopoNode(object):
         else:
             LOGGER.debug("Not updating node %s for new %s due to not newer %s", self.fromid, toids, last_seen)
 
-    def age(self):
+    def age(self) -> float:
         return (datetime.utcnow() - self.last_seen).total_seconds()
 
-    def to_dict(self):
-        return {"from": self.fromid, "location": self.location, "color": self.color, "latency": self.latencies, "target": self.toids, "timestamp": self.last_seen.isoformat()}
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "from": self.fromid,
+            "location": self.location,
+            "color": self.color,
+            "latency": self.latencies,
+            "target": self.toids,
+            "timestamp": self.last_seen.isoformat(),
+        }
 
 
-def custom_json_encoder(o):
+def custom_json_encoder(o: Any) -> Union[str, Dict[str, Any]]:
     """
         A custom json encoder that knows how to encode other types used by this app
     """
     if isinstance(o, datetime):
-        return o.isoformat()
+        return cast(datetime, o).isoformat()
 
     if hasattr(o, "to_dict"):
         return o.to_dict()
@@ -128,14 +141,25 @@ def custom_json_encoder(o):
     raise TypeError(repr(o) + " is not JSON serializable")
 
 
-def json_encode(value):
+def json_encode(value: Any) -> str:
     # see json_encode in tornado.escape
     return json.dumps(value, default=custom_json_encoder).replace("</", "<\\/")
 
 
 class APP(object):
-
-    def __init__(self, site, tier, name, location="", color="", port=8888, connect_to=[], colornodes=False, fastest=False, link_delta=0):
+    def __init__(
+        self,
+        site: str,
+        tier: str,
+        name: str,
+        location: str = "",
+        color: str = "",
+        port: int = 8888,
+        connect_to: List[str] = [],
+        colornodes: bool = False,
+        fastest: bool = False,
+        link_delta: int = 0,
+    ):
         self.site = site
         self.tier = tier
         self.name = name
@@ -145,19 +169,20 @@ class APP(object):
         self.connect_to = connect_to
 
         self.fastest = fastest
-        self.link_delta = link_delta/1000
-        self.node_tier_edge_cache = {}
+        self.link_delta = link_delta / 1000
+        self.node_tier_edge_cache: Dict[Tuple[str, str], str] = {}
 
-        self.connections = {}
+        self.connections: Dict[Tuple[str, str, str, str], Connection] = {}
 
-        self._topology = {}
-        self.self_topology = {}
+        self._topology: Dict[str, TopoNode] = {}
 
         self.colornodes = colornodes
 
         self.http_client = AsyncHTTPClient()
+        self._running = True
+        self._finished = asyncio.Future()
 
-    def _get_connection(self, ip, direction, myid):
+    def _get_connection(self, ip: str, direction: str, myid: Tuple[str, str, str, str]) -> Connection:
         if myid in self.connections:
             connection = self.connections[myid]
         else:
@@ -165,36 +190,32 @@ class APP(object):
             self.connections[myid] = connection
         return connection
 
-    def seen(self, site, tier, name, ip, direction=DIRECTION_IN, latency=-1):
+    def seen(self, site: str, tier: str, name: str, ip: str, direction: str = DIRECTION_IN, latency: float = -1) -> None:
         myid = (site, tier, name, direction)
 
         LOGGER.info("Incoming connection from %s %s %s (%s)", site, tier, name, ip)
 
         connection = self._get_connection(ip, direction, myid)
-
         connection.seen(latency)
 
-    def status(self):
-        return {
-            "id": self.get_id(),
-            "connections": [x for x in self.connections.values()]
-        }
+    def status(self) -> Dict[str, Any]:
+        return {"id": self.get_id(), "connections": [x for x in self.connections.values()]}
 
-    def get_id(self):
+    def get_id(self) -> Dict[str, str]:
         return {"site": self.site, "tier": self.tier, "name": self.name}
 
-    def _get_toponode(self, myid, location, color):
+    def _get_toponode(self, myid: str, location: str, color: str) -> TopoNode:
         if myid in self._topology:
-            connection = self._topology[myid]
+            node = self._topology[myid]
         else:
-            connection = TopoNode(myid, location, color)
-            self._topology[myid] = connection
-        return connection
+            node = TopoNode(myid, location, color)
+            self._topology[myid] = node
+        return node
 
-    def topology(self):
-        return [tn.to_dict() for tn in self._topology.values() if tn.is_alive()]
+    def topology(self) -> List[TopoNode]:
+        return [tn for tn in self._topology.values() if tn.is_alive()]
 
-    def build_self_topo(self):
+    def build_self_topo(self) -> None:
         id = "%s|%s|%s" % (self.site, self.tier, self.name)
         node = self._get_toponode(id, self.location, self.color)
         outgoing = [x for x in self.connections.values() if not x.is_in() and x.is_alive()]
@@ -202,13 +223,13 @@ class APP(object):
         target_latency = {x.short_remote_id(): x.latency for x in outgoing}
         node.update(to, target_latency, datetime.utcnow(), self.location, self.color)
 
-    def update_topology_safe(self, topo):
+    def update_topology_safe(self, topo: List[Dict[str, Any]]) -> None:
         try:
             self.update_topology(topo)
         except Exception:
             LOGGER.exception("Failed to process topology update")
 
-    def update_topology(self, topo):
+    def update_topology(self, topo: List[Dict[str, Any]]) -> None:
         for node in topo:
             fromid = node["from"]
             target = node["target"]
@@ -219,14 +240,19 @@ class APP(object):
             toponode = self._get_toponode(fromid, location, color=color)
             toponode.update(target, latency, ts, location, color=color)
 
-    @gen.coroutine
-    def check(self, url):
+    async def check(self, url: str) -> None:
+        LOGGER.info("Sending ping to %s from %s", url, self.get_id())
         connection = self._get_connection(url, DIRECTION_OUT, url)
         try:
             body = {"id": self.get_id(), "topology": self.topology()}
-            request = HTTPRequest(url + "/ping", "POST", headers={"Content-Type": "application/json"},
-                                  body=json_encode(body), request_timeout=0.9 * POLLING_INTERVAL_SECONDS)
-            response = yield self.http_client.fetch(request)
+            request = HTTPRequest(
+                url + "/ping",
+                "POST",
+                headers={"Content-Type": "application/json"},
+                body=json_encode(body),
+                request_timeout=0.9 * POLLING_INTERVAL_SECONDS,
+            )
+            response = await self.http_client.fetch(request)
             data = json_decode(response.body)
 
             remote_id = data["id"]
@@ -244,11 +270,10 @@ class APP(object):
             connection.message = repr(e)
             connection.dead()
 
-    @gen.coroutine
-    def run(self):
+    async def run(self) -> None:
         ioloop = tornado.ioloop.IOLoop.current()
 
-        while True:
+        while self._running:
             start = ioloop.time()
 
             for toponode in [k for k, c in self._topology.items() if c.age() > TOPOLOGY_TIMEOUT_SECONDS]:
@@ -256,7 +281,7 @@ class APP(object):
 
             self.build_self_topo()
 
-            yield [self.check(url) for url in self.connect_to]
+            await asyncio.gather(*[self.check(url) for url in self.connect_to])
 
             end = ioloop.time()
             duration = end - start
@@ -264,100 +289,120 @@ class APP(object):
 
             LOGGER.info("Iteration done in %d time, sleeping %d" % (duration, sleeptime))
 
-            yield gen.sleep(sleeptime)
+            await asyncio.sleep(sleeptime)
 
-    def topology_dot(self):
-        def clean(ident):
+        self._finished.set_result(None)
+
+    async def stop(self) -> None:
+        self._running = False
+        await self._finished
+
+    def topology_dot(self) -> str:
+        def clean(ident: str) -> str:
             return ident.replace("|", "_").replace(" ", "_")
 
-        lines = ["""digraph {"""]
+        lines: List[str] = ["""digraph {"""]
 
-        def render_edge(fromnode, tonode, latency):
-            return "\"%s\" -> \"%s\" [label=\"%.0f\"];" % (clean(fromnode), clean(tonode), latency * 1000)
+        def render_edge(fromnode: str, tonode: str, latency: float) -> str:
+            return '"%s" -> "%s" [label="%.0f"];' % (clean(fromnode), clean(tonode), latency * 1000)
 
-        def get_tier(nodeid):
+        def get_tier(nodeid: str) -> str:
             return nodeid.split("|")[1]
 
         if not self.fastest:
-            lines += [render_edge(tnode.fromid, tonode, latency)
-                      for tnode in self._topology.values() for tonode, latency in tnode.latencies.items()]
+            lines += [
+                render_edge(tnode.fromid, tonode, latency)
+                for tnode in self._topology.values()
+                for tonode, latency in tnode.latencies.items()
+            ]
         else:
-            node_to_latency = [(tnode.fromid, tonode, latency)
-                               for tnode in self._topology.values() for tonode, latency in tnode.latencies.items()]
-            node_tier_to_tier_latency = [(node, get_tier(node), tonode, get_tier(tonode), latecny)
-                                         for node, tonode, latecny in node_to_latency]
+            node_to_latency: List[Tuple[str, str, float]] = [
+                (tnode.fromid, tonode, latency)
+                for tnode in self._topology.values()
+                for tonode, latency in tnode.latencies.items()
+            ]
+            node_tier_to_tier_latency: List[Tuple[str, str, str, str, float]] = [
+                (node, get_tier(node), tonode, get_tier(tonode), latency) for node, tonode, latency in node_to_latency
+            ]
             # same tier
-            lines += [render_edge(fromnode, tonode, latency) for fromnode, fromtier, tonode, totier,
-                      latency in node_tier_to_tier_latency if fromtier == totier]
-            #not same
+            lines += [
+                render_edge(fromnode, tonode, latency)
+                for fromnode, fromtier, tonode, totier, latency in node_tier_to_tier_latency
+                if fromtier == totier
+            ]
 
-            def get_latency(fromnode, totier, tonode, latency):
+            # not same
+            def get_latency(fromnode: str, totier: str, tonode: str, latency: float) -> float:
                 if (fromnode, totier) in self.node_tier_edge_cache and self.node_tier_edge_cache[(fromnode, totier)] == tonode:
                     return latency - self.link_delta
                 return latency
 
-            node_totier_tonode_latency = [(fromnode, totier, tonode, latency, get_latency(fromnode, totier, tonode, latency)) for fromnode, fromtier,
-                                          tonode, totier, latency in node_tier_to_tier_latency if fromtier != totier]
-            node_totier__tonode_latency = groupby(
-                sorted(node_totier_tonode_latency, key=lambda t: (t[0], t[1])), lambda t: (t[0], t[1]))
+            node_totier_tonode_latency: List[Tuple[str, str, str, float, float]] = [
+                (fromnode, totier, tonode, latency, get_latency(fromnode, totier, tonode, latency))
+                for fromnode, fromtier, tonode, totier, latency in node_tier_to_tier_latency
+                if fromtier != totier
+            ]
 
-            node_totier__tonode_latency = [(node, sorted(i, key=lambda x:x[4])) for node, i in node_totier__tonode_latency]
+            grouped_node_totier_tonode_latency: Iterator[Tuple[Tuple[str, str], Iterator[Tuple[str, str, str, float, float]]]] = groupby(
+                sorted(node_totier_tonode_latency, key=lambda t: (t[0], t[1])), lambda t: (t[0], t[1])
+            )
+
+            node_totier__tonode_latency = [(node, sorted(i, key=lambda x: x[4])) for node, i in grouped_node_totier_tonode_latency]
 
             self.node_tier_edge_cache = {(fromnode[0], fromnode[1]): nl[0][2] for fromnode, nl in node_totier__tonode_latency}
-
             lines += [render_edge(fromnode[0], nl[0][2], nl[0][3]) for fromnode, nl in node_totier__tonode_latency]
 
-        node_location = {tnode: tnode.location for tnode in self._topology.values()}
+        node_location: Dict[TopoNode, str] = {tnode: tnode.location for tnode in self._topology.values()}
 
-        location_node = groupby(sorted(node_location.items(), key=lambda x: x[1]), lambda x: x[1])
-        location_node = [(k, [l[0] for l in g]) for k, g in location_node]
+        location_node_groups: Iterator[Tuple[str, Iterator[Tuple[TopoNode, str]]]] = groupby(sorted(node_location.items(), key=lambda x: x[1]), lambda x: x[1])
+        location_node = [(k, [l[0] for l in g]) for k, g in location_node_groups]
 
-        def render_node(node):
+        def render_node(node: TopoNode) -> str:
             if node.color != "" and self.colornodes:
-                return "\"%s\" [color=%s];" % (clean(node.fromid), node.color)
+                return '"%s" [color=%s];' % (clean(node.fromid), node.color)
             else:
-                return "\"%s\";" % clean(node.fromid)
+                return '"%s";' % clean(node.fromid)
 
-        def render_nodes(nodes):
+        def render_nodes(nodes: List[TopoNode]) -> str:
             return "\n".join([render_node(node) for node in nodes])
 
-        lines += ["subgraph \"cluster_%s\" { \n %s \n label=\"%s\";\n}" %
-                  (clean(location), render_nodes(nodes), location) for (location, nodes) in location_node]
+        lines += [
+            'subgraph "cluster_%s" { \n %s \n label="%s";\n}' % (clean(location), render_nodes(nodes), location)
+            for (location, nodes) in location_node
+        ]
 
         lines += ["}"]
 
         return "\n".join(lines)
 
-    def get_location_color(self):
+    def get_location_color(self) -> Dict[str, str]:
         pairs = [(tnode.location, tnode.color) for tnode in self._topology.values()]
-        lc = {}
+        lc: Dict[str, str] = {}
         for l, c in pairs:
             if l not in lc:
                 lc[l] = c
             elif lc[l] != c:
-                LOGGER.warn("Same location with two colors: %s %s %s" % (l, lc[l], c))
+                LOGGER.warning("Same location with two colors: %s %s %s" % (l, lc[l], c))
         return lc
 
 
 class AppHandler(tornado.web.RequestHandler):
+    def __init__(
+        self, application: tornado.web.Application, request: tornado.httputil.HTTPServerRequest, app: APP
+    ) -> None:
+        super().__init__(application, request, app=app)
 
-    def __init__(self, application, request, app: APP, **kwargs):
-        super(AppHandler, self).__init__(application, request, **kwargs)
+    def initialize(self, app: APP) -> None:
         self.app = app
 
-    def error(self, status, msg):
+    def error(self, status: int, msg: str) -> None:
         self.set_header("Content-Type", "application/json")
         self.write(tornado.escape.json_encode({"message": msg}))
         self.set_status(status, msg)
 
 
 class PingHandler(AppHandler):
-
-    def __init__(self, application, request, app: APP, **kwargs):
-        super(AppHandler, self).__init__(application, request, **kwargs)
-        self.app = app
-
-    def post(self, *args, **kwargs):
+    def post(self, *args: str, **kwargs: str) -> None:
         data = tornado.escape.json_decode(self.request.body)
         if not ("id" in data and "topology" in data):
             self.error(400, "Body should contain the fields 'id and 'topology'")
@@ -375,34 +420,19 @@ class PingHandler(AppHandler):
 
 
 class StatusHandler(AppHandler):
-
-    def __init__(self, application, request, app: APP, **kwargs):
-        super(AppHandler, self).__init__(application, request, **kwargs)
-        self.app = app
-
-    def get(self):
+    def get(self) -> None:
         self.set_header("Content-Type", "application/json")
         self.write(json_encode(self.app.status()))
 
 
 class TopoHandler(AppHandler):
-
-    def __init__(self, application, request, app: APP, **kwargs):
-        super(AppHandler, self).__init__(application, request, **kwargs)
-        self.app = app
-
-    def get(self):
+    def get(self) -> None:
         self.set_header("Content-Type", "application/json")
         self.write(json_encode(self.app.topology()))
 
 
 class DotHandler(AppHandler):
-
-    def __init__(self, application, request, app: APP, **kwargs):
-        super(AppHandler, self).__init__(application, request, **kwargs)
-        self.app = app
-
-    def get(self):
+    def get(self) -> None:
         self.set_header("Content-Type", "text/plain")
         self.write(self.app.topology_dot())
 
@@ -418,16 +448,11 @@ function TimedRefresh( t ) {
 
 
 class StaticMapHandler(AppHandler):
-
-    def __init__(self, application, request, app: APP, **kwargs):
-        super(AppHandler, self).__init__(application, request, **kwargs)
-        self.app = app
-
-    def get(self):
+    def get(self) -> None:
         location_color = self.app.get_location_color()
 
-        color_location = groupby(sorted(location_color.items(), key=lambda x: x[1]), lambda x: x[1])
-        color_location = [(k, [v[0] for v in locations]) for (k, locations) in color_location]
+        grouped_color_location = groupby(sorted(location_color.items(), key=lambda x: x[1]), lambda x: x[1])
+        color_location = [(k, [v[0] for v in locations]) for (k, locations) in grouped_color_location]
 
         def marker_for_color(color, locations):
             return ("markers", ("color:%s|" % color) + "|".join(locations))
@@ -443,23 +468,16 @@ class StaticMapHandler(AppHandler):
 
 
 class PngHandler(AppHandler):
-
-    def __init__(self, application, request, app: APP, **kwargs):
-        super(AppHandler, self).__init__(application, request, **kwargs)
-        self.app = app
-
-    @gen.coroutine
-    def get(self):
+    async def get(self) -> None:
         self.set_header("Content-Type", "image/png")
         self.set_header("Cache-Control:", "no-store")
         dot = self.app.topology_dot()
 
         out = tempfile.NamedTemporaryFile()
-        proc = tornado.process.Subprocess(["dot", "-Tpng"], stdin=tornado.process.Subprocess.STREAM,
-                                          stdout=out)
-        yield proc.stdin.write(dot.encode())
+        proc = tornado.process.Subprocess(["dot", "-Tpng"], stdin=tornado.process.Subprocess.STREAM, stdout=out)
+        await proc.stdin.write(dot.encode())
         proc.stdin.close()
-        ret = yield proc.wait_for_exit(raise_error=False)
+        ret = await proc.wait_for_exit(raise_error=False)
         proc.uninitialize()
         out.seek(0)
 
@@ -467,18 +485,18 @@ class PngHandler(AppHandler):
 
 
 class IndexHandler(tornado.web.RequestHandler):
-
-    @gen.coroutine
-    def get(self):
+    def get(self) -> None:
         self.set_header("Content-Type", "text/html")
-        self.write("""<html> <head>
+        self.write(
+            """<html> <head>
 <script type="text/JavaScript">
 function TimedRefresh( t ) {
     setTimeout("location.reload(true);", t);
 }
 </script>
 </head> <body onload="JavaScript:TimedRefresh(5000);"> <img src="png"/> </body></html>
-""")
+"""
+        )
 
 
 dynamap = """
@@ -563,54 +581,79 @@ dynamap = """
 
 
 class MapHandler(tornado.web.RequestHandler):
-
-    @gen.coroutine
-    def get(self):
+    async def get(self) -> None:
         self.set_header("Content-Type", "text/html")
         self.write(dynamap)
 
 
-def make_app(site, tier, name, location, color, connect_to, port=8888, colornodes=False, fastest=False, link_delta=False):
-    app = APP(site=site, tier=tier, location=location, color=color, name=name,
-              connect_to=connect_to, colornodes=colornodes, fastest=fastest, link_delta=link_delta)
+def make_app(
+    site: str,
+    tier: str,
+    name: str,
+    location: str,
+    color: str,
+    connect_to: List[str],
+    port: int = 8888,
+    colornodes: bool = False,
+    fastest: bool = False,
+    link_delta: bool = False,
+) -> APP:
+    app = APP(
+        site=site,
+        tier=tier,
+        location=location,
+        color=color,
+        name=name,
+        connect_to=connect_to,
+        colornodes=colornodes,
+        fastest=fastest,
+        link_delta=link_delta,
+    )
 
     tornado.ioloop.IOLoop.current().add_callback(app.run)
-    app = tornado.web.Application([
-        (r"/ping", PingHandler, {"app": app}),
-        (r"/status", StatusHandler, {"app": app}),
-        (r"/topo", TopoHandler, {"app": app}),
-        (r"/dot", DotHandler, {"app": app}),
-        (r"/png", PngHandler, {"app": app}),
-        (r"/smap", StaticMapHandler, {"app": app}),
-        (r"/map", MapHandler),
-        (r"/", IndexHandler),
-        (r"/index.html", IndexHandler)
+    rules = [
+        routing.Rule(routing.PathMatches(r"/ping"), PingHandler, {"app": app}),
+        routing.Rule(routing.PathMatches(r"/status"), StatusHandler, {"app": app}),
+        routing.Rule(routing.PathMatches(r"/topo"), TopoHandler, {"app": app}),
+        routing.Rule(routing.PathMatches(r"/dot"), DotHandler, {"app": app}),
+        routing.Rule(routing.PathMatches(r"/png"), PngHandler, {"app": app}),
+        routing.Rule(routing.PathMatches(r"/smap"), StaticMapHandler, {"app": app}),
+        routing.Rule(routing.PathMatches(r"/map"), MapHandler),
+        routing.Rule(routing.PathMatches(r"/"), IndexHandler),
+        routing.Rule(routing.PathMatches(r"/index.html"), IndexHandler),
+    ]
 
-    ])
+    tornado_app = tornado.web.Application(rules)
 
-    app.listen(port)
-    LOGGER.warn("Listening on port %d", port)
+    tornado_app.listen(port)
+    LOGGER.warning("Listening on port %d", port)
 
-
-log_levels = {
-    0: logging.ERROR,
-    1: logging.WARNING,
-    2: logging.INFO,
-    3: logging.DEBUG,
-    4: 2
-}
+    return app
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Networking test app')
-    parser.add_argument("-c", "--config", dest="config_file", help='config file', default="config.toml")
-    parser.add_argument('-v', '--verbose', action='count', default=0,
-                        help="Log level for messages going to the console. Default is only errors,"
-                        "-v warning, -vv info and -vvv debug and -vvvv trace")
-    parser.add_argument("--colornodes", dest="colornodes",
-                        help='enable to render nodes in dot in the color inidicated in the config file of that node', action='store_true')
-    parser.add_argument("--fastest", dest="fastest",
-                        help='only rendere fastest link from one node to other tier', action='store_true')
+log_levels = {0: logging.ERROR, 1: logging.WARNING, 2: logging.INFO, 3: logging.DEBUG, 4: 2}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Networking test app")
+    parser.add_argument("-c", "--config", dest="config_file", help="config file", default="config.toml")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Log level for messages going to the console. Default is only errors,"
+        "-v warning, -vv info and -vvv debug and -vvvv trace",
+    )
+    parser.add_argument(
+        "--colornodes",
+        dest="colornodes",
+        help="enable to render nodes in dot in the color inidicated in the config file of that node",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--fastest", dest="fastest", help="only rendere fastest link from one node to other tier", action="store_true"
+    )
     normalformatter = logging.Formatter(fmt="%(levelname)-8s%(message)s")
     stream = logging.StreamHandler()
     stream.setLevel(logging.INFO)
@@ -622,6 +665,7 @@ def main():
     options = parser.parse_args()
 
     # set the log level
+    assert isinstance(options.verbose, int)
     level = options.verbose
     if level >= len(log_levels):
         level = 3
@@ -629,19 +673,27 @@ def main():
 
     cfg = toml.load(options.config_file)
 
-    def get_or(name, default):
+    def get_or(name: str, default: OptT) -> OptT:
         if name in cfg:
-            return cfg[name]
+            return cast(OptT, cfg[name])
         else:
             return default
 
-    make_app(get_or("site", "DEFAULTSITE"), get_or("tier", "DEFAULTTIER"),
-             get_or("name", "DEFAULTNAME"), location=get_or("location", ""),
-             color=get_or("color", ""),
-             connect_to=get_or("connect_to", []), port=int(get_or("port", 8888)),
-             colornodes=get_or("colornodes", options.colornodes),
-             fastest=get_or("fastest", options.fastest),
-             link_delta=get_or("renderdelta", 0))
+    assert isinstance(options.colornodes, bool)
+    assert isinstance(options.fastest, bool)
+
+    make_app(
+        get_or("site", "DEFAULTSITE"),
+        get_or("tier", "DEFAULTTIER"),
+        get_or("name", "DEFAULTNAME"),
+        location=get_or("location", ""),
+        color=get_or("color", ""),
+        connect_to=get_or("connect_to", []),
+        port=int(get_or("port", 8888)),
+        colornodes=get_or("colornodes", options.colornodes),
+        fastest=get_or("fastest", options.fastest),
+        link_delta=get_or("renderdelta", False),
+    )
 
     tornado.ioloop.IOLoop.current().start()
 
